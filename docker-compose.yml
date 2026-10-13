@@ -1,0 +1,181 @@
+version: "3.9"
+
+services:
+
+  # ── PostgreSQL with pgvector Support ───────────────────────────────────────
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: newsengine_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-mfeeddb}
+      POSTGRES_USER: ${POSTGRES_USER:-admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-admin}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-admin}" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── MinIO ──────────────────────────────────────────────────────────────────
+  minio:
+    image: minio/minio:latest
+    container_name: newsengine_minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-minioadmin}
+    volumes:
+      - minio_data:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:9000/minio/health/live" ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # ── Ollama (LLM local, free) ───────────────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: newsengine_ollama
+    restart: unless-stopped
+    volumes:
+      - ollama_data:/root/.ollama
+    ports:
+      - "11434:11434"
+    # Para GPU Nvidia, descomenta:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:11434/api/tags" ]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  # ── Pull do modelo (roda uma vez e sai) ───────────────────────────────────
+  ollama-pull:
+    image: ollama/ollama:latest
+    container_name: newsengine_ollama_pull
+    depends_on:
+      ollama:
+        condition: service_healthy
+    entrypoint: >
+      sh -c "ollama pull ${AI_MODEL:-mistral:7b} &&
+             echo 'Modelo pronto.'"
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    restart: "no"
+
+  # ── News Engine ────────────────────────────────────────────────────────────
+  engine:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: newsengine_engine
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-newsdb}
+      POSTGRES_USER: ${POSTGRES_USER:-newsuser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-newspass}
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
+      MINIO_SECURE: "false"
+      OLLAMA_BASE_URL: http://ollama:11434
+      AI_MODEL: ${AI_MODEL:-mistral:7b}
+      AI_MAX_TOKENS: 4096
+      AI_TIMEOUT: 180
+      INGESTION_CRON: "0 6 * * *"
+      DISCOVERY_CRON: "0 2 * * 0"
+      AI_PROCESSING_INTERVAL: "300"
+      LOG_LEVEL: INFO
+      DISCOVERY_TERMS: "Angola notícias,Africa business news,global economy news,technology Africa"
+    volumes:
+      - engine_logs:/app/logs
+
+  # ── API (Endpoints REST) ───────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: newsengine_api
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-newsdb}
+      POSTGRES_USER: ${POSTGRES_USER:-newsuser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-newspass}
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
+      MINIO_SECURE: "false"
+      LOG_LEVEL: INFO
+    ports:
+      - "5000:5000"
+    entrypoint: [ "python", "src/app.py" ]
+
+  # ── CLI (comandos manuais) ─────────────────────────────────────────────────
+  cli:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: newsengine_cli
+    profiles: [ "cli" ]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-mfeeddb}
+      POSTGRES_USER: ${POSTGRES_USER:-admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-admin}
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
+      MINIO_SECURE: "false"
+      OLLAMA_BASE_URL: http://ollama:11434
+      AI_MODEL: ${AI_MODEL:-mistral:7b}
+      AI_TIMEOUT: 180
+      LOG_LEVEL: INFO
+    entrypoint: [ "python", "src/cli.py" ]
+
+volumes:
+  postgres_data:
+  minio_data:
+  ollama_data:
+  engine_logs:
+
+networks:
+  default:
+    name: newsengine_net
