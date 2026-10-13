@@ -16,6 +16,7 @@ data
 .pytest_cache
 .env
 venv
+*/groqteste.py
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
